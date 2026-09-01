@@ -1012,12 +1012,13 @@ fn ui(f: &mut Frame, app: &mut App) {
     f.render_widget(Paragraph::new(bottom_text).style(Style::default().fg(Color::Gray)), main_layout[2]);
     
     if app.show_version_popup {
-        let area = centered_rect(40, 40, size);
+        let popup_height = (app.versions.len() as u16 + 2).min(size.height);
+        let area = top_right_rect(30, popup_height, size);
         f.render_widget(Clear, area);
         
         let items: Vec<ListItem> = app.versions.iter().map(|v| ListItem::new(v.as_str())).collect();
         let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title("Select Version (j/k to change, Enter/Esc to close)").border_style(Style::default().fg(Color::Yellow)))
+            .block(Block::default().borders(Borders::ALL).title(" Version ").border_style(Style::default().fg(Color::Yellow)))
             .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD));
             
         f.render_stateful_widget(list, area, &mut app.versions_state);
@@ -1060,6 +1061,24 @@ fn ui(f: &mut Frame, app: &mut App) {
         let block = Block::default().borders(Borders::ALL).title(" Quick Jump ").border_style(Style::default().fg(Color::Cyan));
         f.render_widget(Paragraph::new(text).block(block), area);
     }
+}
+
+fn top_right_rect(width: u16, height: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(height),
+            Constraint::Min(0),
+        ])
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(width.min(r.width)),
+        ])
+        .split(popup_layout[0])[1]
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
