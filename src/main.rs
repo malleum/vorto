@@ -288,33 +288,63 @@ impl App {
     }
     
     fn yank_selection(&mut self) {
-        if let Some(clipboard) = &mut self.clipboard {
-            if let Some(View::Verses { items, filtered, state, visual_start, book, chapter }) = self.view_stack.last_mut() {
-                if let Some(end_idx) = state.selected() {
-                    let start_idx = visual_start.unwrap_or(end_idx);
-                    let min_idx = start_idx.min(end_idx);
-                    let max_idx = start_idx.max(end_idx);
-                    
-                    let mut copied_text = format!("{} {}\n", book, chapter);
-                    for i in min_idx..=max_idx {
-                        if let Some(&orig_idx) = filtered.get(i) {
-                            if let Some(v) = items.get(orig_idx) {
-                                copied_text.push_str(&format!("[{}] {}\n", v.verse, v.text));
-                            }
+        let mut copied_text = String::new();
+        let mut success = false;
+        let mut count = 0;
+        
+        if let Some(View::Verses { items, filtered, state, visual_start, book, chapter }) = self.view_stack.last_mut() {
+            if let Some(end_idx) = state.selected() {
+                let start_idx = visual_start.unwrap_or(end_idx);
+                let min_idx = start_idx.min(end_idx);
+                let max_idx = start_idx.max(end_idx);
+                
+                copied_text = format!("{} {}\n", book, chapter);
+                for i in min_idx..=max_idx {
+                    if let Some(&orig_idx) = filtered.get(i) {
+                        if let Some(v) = items.get(orig_idx) {
+                            copied_text.push_str(&format!("[{}] {}\n", v.verse, v.text));
                         }
                     }
-                    
-                    if clipboard.set_text(copied_text).is_ok() {
-                        let count = max_idx - min_idx + 1;
-                        self.message = Some(format!("Yanked {} verse(s)", count));
-                    } else {
-                        self.message = Some("Failed to write to clipboard".to_string());
+                }
+                count = max_idx - min_idx + 1;
+                *visual_start = None;
+            }
+        }
+        
+        if count > 0 {
+            if let Some(clipboard) = &mut self.clipboard {
+                if clipboard.set_text(copied_text.clone()).is_ok() {
+                    success = true;
+                }
+            }
+            if !success {
+                // Fallback to wl-copy for wayland
+                if let Ok(mut child) = std::process::Command::new("wl-copy").stdin(std::process::Stdio::piped()).spawn() {
+                    if let Some(mut stdin) = child.stdin.take() {
+                        let _ = std::io::Write::write_all(&mut stdin, copied_text.as_bytes());
+                    }
+                    if let Ok(status) = child.wait() {
+                        if status.success() { success = true; }
                     }
                 }
-                *visual_start = None; // Exit visual mode
             }
-        } else {
-            self.message = Some("Clipboard not available".to_string());
+            if !success {
+                // Fallback to xclip for X11
+                if let Ok(mut child) = std::process::Command::new("xclip").arg("-selection").arg("clipboard").stdin(std::process::Stdio::piped()).spawn() {
+                    if let Some(mut stdin) = child.stdin.take() {
+                        let _ = std::io::Write::write_all(&mut stdin, copied_text.as_bytes());
+                    }
+                    if let Ok(status) = child.wait() {
+                        if status.success() { success = true; }
+                    }
+                }
+            }
+            
+            if success {
+                self.message = Some(format!("Yanked {} verse(s)", count));
+            } else {
+                self.message = Some("Failed to copy (clipboard/wl-copy/xclip failed)".to_string());
+            }
         }
     }
     
@@ -330,22 +360,32 @@ impl App {
         let books = self.db.get_books(self.current_version()).unwrap_or_default();
         let filtered = (0..books.len()).collect();
         let mut state = ListState::default();
-        if !books.is_empty() { state.select(Some(0)); }
+        if let Some(View::Books { state: old_state, .. }) = old_stack.first() {
+            state.select(old_state.selected());
+        } else if !books.is_empty() { 
+            state.select(Some(0)); 
+        }
         
         self.view_stack.push(View::Books { items: books, filtered, state });
         
         for view in old_stack.iter().skip(1) {
             match view {
-                View::Chapters { book, .. } => {
+                View::Chapters { book, state: old_state, .. } => {
                     self.push_chapters_view(book.clone());
+                    if let Some(View::Chapters { state, .. }) = self.view_stack.last_mut() {
+                        state.select(old_state.selected());
+                    }
                 }
-                View::Verses { book, chapter, .. } => {
+                View::Verses { book, chapter, state: old_state, .. } => {
                     self.push_verses_view(book.clone(), *chapter);
+                    if let Some(View::Verses { state, .. }) = self.view_stack.last_mut() {
+                        state.select(old_state.selected());
+                    }
                 }
-                View::SearchResults { query, .. } => {
+                View::SearchResults { query, state: old_state, .. } => {
                     let results = self.db.search(self.current_version(), query).unwrap_or_default();
                     let mut state = ListState::default();
-                    if !results.is_empty() { state.select(Some(0)); }
+                    state.select(old_state.selected());
                     self.view_stack.push(View::SearchResults {
                         query: query.clone(),
                         items: results,
@@ -621,6 +661,9 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<(), B
                         KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             app.jump_forward();
                         }
+                        KeyCode::Tab => {
+                            app.jump_forward();
+                        }
                         KeyCode::Char('j') | KeyCode::Down => move_cursor(&mut app, MoveDir::Down),
                         KeyCode::Char('k') | KeyCode::Up => move_cursor(&mut app, MoveDir::Up),
                         KeyCode::Char('G') => move_cursor(&mut app, MoveDir::Bottom),
@@ -868,7 +911,8 @@ fn ui(f: &mut Frame, app: &mut App) {
                     ListItem::new(format!(" {}", items[i]))
                 }).collect();
                 let list = List::new(list_items)
-                    .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+                    .highlight_style(Style::default().bg(Color::Rgb(40, 40, 40)).fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                    .highlight_symbol("> ");
                 f.render_stateful_widget(list, main_layout[1], state);
             }
             View::Chapters { items, filtered, state, .. } => {
@@ -876,10 +920,12 @@ fn ui(f: &mut Frame, app: &mut App) {
                     ListItem::new(format!(" Chapter {}", items[i]))
                 }).collect();
                 let list = List::new(list_items)
-                    .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+                    .highlight_style(Style::default().bg(Color::Rgb(40, 40, 40)).fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                    .highlight_symbol("> ");
                 f.render_stateful_widget(list, main_layout[1], state);
             }
             View::Verses { items, filtered, state, visual_start, .. } => {
+                let width = main_layout[1].width.saturating_sub(6) as usize;
                 let list_items: Vec<ListItem> = filtered.iter().enumerate().map(|(ui_idx, &i)| {
                     let v = &items[i];
                     let mut style = Style::default();
@@ -889,29 +935,62 @@ fn ui(f: &mut Frame, app: &mut App) {
                             let min = start.min(curr);
                             let max = start.max(curr);
                             if ui_idx >= min && ui_idx <= max {
-                                style = style.bg(Color::DarkGray);
+                                style = style.bg(Color::Rgb(60, 60, 60));
                             }
                         }
                     }
                     
-                    ListItem::new(Line::from(vec![
-                        Span::styled(format!("{:>3} ", v.verse), Style::default().fg(Color::DarkGray)),
-                        Span::raw(&v.text),
-                    ])).style(style)
+                    let wrapped = textwrap::wrap(&v.text, width);
+                    let mut lines = Vec::new();
+                    
+                    for (line_idx, line) in wrapped.iter().enumerate() {
+                        if line_idx == 0 {
+                            lines.push(Line::from(vec![
+                                Span::styled(format!("{:>3} ", v.verse), Style::default().fg(Color::DarkGray)),
+                                Span::raw(line.to_string()),
+                            ]));
+                        } else {
+                            lines.push(Line::from(vec![
+                                Span::raw("    "),
+                                Span::raw(line.to_string()),
+                            ]));
+                        }
+                    }
+                    
+                    ListItem::new(lines).style(style)
                 }).collect();
                 let list = List::new(list_items)
-                    .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+                    .highlight_style(Style::default().bg(Color::Rgb(40, 40, 40)).fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                    .highlight_symbol(">> ");
                 f.render_stateful_widget(list, main_layout[1], state);
             }
             View::SearchResults { items, state, .. } => {
+                let width = main_layout[1].width.saturating_sub(6) as usize;
                 let list_items: Vec<ListItem> = items.iter().map(|res| {
-                    ListItem::new(Line::from(vec![
-                        Span::styled(format!("{:<15} {:>3}:{:>3} | ", res.book, res.chapter, res.verse), Style::default().fg(Color::Cyan)),
-                        Span::raw(&res.text),
-                    ]))
+                    let prefix = format!("{:<15} {:>3}:{:>3} | ", res.book, res.chapter, res.verse);
+                    let prefix_len = prefix.len();
+                    
+                    let wrapped = textwrap::wrap(&res.text, width.saturating_sub(prefix_len));
+                    let mut lines = Vec::new();
+                    
+                    for (line_idx, line) in wrapped.iter().enumerate() {
+                        if line_idx == 0 {
+                            lines.push(Line::from(vec![
+                                Span::styled(prefix.clone(), Style::default().fg(Color::Cyan)),
+                                Span::raw(line.to_string()),
+                            ]));
+                        } else {
+                            lines.push(Line::from(vec![
+                                Span::raw(" ".repeat(prefix_len)),
+                                Span::raw(line.to_string()),
+                            ]));
+                        }
+                    }
+                    ListItem::new(lines)
                 }).collect();
                 let list = List::new(list_items)
-                    .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+                    .highlight_style(Style::default().bg(Color::Rgb(40, 40, 40)).fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                    .highlight_symbol("> ");
                 f.render_stateful_widget(list, main_layout[1], state);
             }
         }

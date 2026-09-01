@@ -38,7 +38,8 @@
           nativeBuildInputs = [ pkgs.makeWrapper ];
           postInstall = ''
             wrapProgram $out/bin/vorto \
-              --set VORTO_DB_PATH ${bibles_db}/share/vorto/bibles.db
+              --set VORTO_DB_PATH ${bibles_db}/share/vorto/bibles.db \
+              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.wl-clipboard pkgs.xclip ]}
           '';
         };
 
@@ -50,6 +51,8 @@
             clippy
             sqlite
             python3
+            wl-clipboard
+            xclip
           ];
           shellHook = ''
             export VORTO_DB_PATH="${bibles_db}/share/vorto/bibles.db"
