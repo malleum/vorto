@@ -24,9 +24,25 @@ book_map = {
 
 def strip_usfm_tags(text):
     text = re.sub(r'\\[fx]\s.*?\\[fx]\*', '', text)
-    text = re.sub(r'(\\[+a-z0-9]+)\s+([^|]*?)\|.*?\1\*', r'\2', text)
-    text = re.sub(r'(\\[+a-z0-9]+)\s+(.*?)\1\*', r'\2', text)
+    
+    # 1. Strip innermost tags with attributes (strictly no inner backslashes)
+    while True:
+        prev = text
+        text = re.sub(r'(\\[+a-z0-9]+)\s+([^|\\]+?)\|[^\\\*]*?\1\*', r'\2', text)
+        if prev == text:
+            break
+            
+    # 2. Strip innermost tags without attributes (strictly no inner backslashes)
+    while True:
+        prev = text
+        text = re.sub(r'(\\[+a-z0-9]+)\s+([^|\\]*?)\1\*', r'\2', text)
+        if prev == text:
+            break
+            
+    # 3. Strip any remaining wrapper tags (like \wj) or structural tags (like \p)
+    text = re.sub(r'\\[+a-z0-9]+\*', '', text)
     text = re.sub(r'\\[+a-z0-9]+\s*', '', text)
+    
     text = re.sub(r'\[\s*([^\]]+?)\s*\]', r'\1', text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
