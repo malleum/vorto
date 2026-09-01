@@ -147,16 +147,28 @@ impl App {
         if let Some(view) = self.view_stack.last_mut() {
             match view {
                 View::Books { filtered, items, state, .. } => {
+                    let mut orig_idx = None;
+                    if let Some(idx) = state.selected() {
+                        orig_idx = filtered.get(idx).copied();
+                    }
                     *filtered = (0..items.len()).collect();
-                    state.select(if items.is_empty() { None } else { Some(0) });
+                    state.select(orig_idx.or(if items.is_empty() { None } else { Some(0) }));
                 }
                 View::Chapters { filtered, items, state, .. } => {
+                    let mut orig_idx = None;
+                    if let Some(idx) = state.selected() {
+                        orig_idx = filtered.get(idx).copied();
+                    }
                     *filtered = (0..items.len()).collect();
-                    state.select(if items.is_empty() { None } else { Some(0) });
+                    state.select(orig_idx.or(if items.is_empty() { None } else { Some(0) }));
                 }
                 View::Verses { filtered, items, state, .. } => {
+                    let mut orig_idx = None;
+                    if let Some(idx) = state.selected() {
+                        orig_idx = filtered.get(idx).copied();
+                    }
                     *filtered = (0..items.len()).collect();
-                    state.select(if items.is_empty() { None } else { Some(0) });
+                    state.select(orig_idx.or(if items.is_empty() { None } else { Some(0) }));
                 }
                 _ => {}
             }
