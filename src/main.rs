@@ -1,27 +1,55 @@
 mod db;
 
-use std::{env, error::Error, io};
-use db::{Database, SearchResult, Verse};
+use arboard::Clipboard;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use db::{Database, SearchResult, Verse};
 use ratatui::{
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap, Clear},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
+use std::{env, error::Error, io};
 
-enum ActivePane {
-    Books,
-    Chapters,
-    Content,
-    SearchInput,
-    SearchResults,
+#[derive(Clone)]
+enum View {
+    Books {
+        items: Vec<String>,
+        filtered: Vec<usize>,
+        state: ListState,
+    },
+    Chapters {
+        book: String,
+        items: Vec<u32>,
+        filtered: Vec<usize>,
+        state: ListState,
+    },
+    Verses {
+        book: String,
+        chapter: u32,
+        items: Vec<Verse>,
+        filtered: Vec<usize>,
+        state: ListState,
+        visual_start: Option<usize>,
+    },
+    SearchResults {
+        query: String,
+        items: Vec<SearchResult>,
+        state: ListState,
+    },
+}
+
+#[derive(PartialEq)]
+enum InputMode {
+    Normal,
+    Filter,
+    GlobalSearch,
 }
 
 struct App {
@@ -29,25 +57,20 @@ struct App {
     versions: Vec<String>,
     current_version_idx: usize,
     
-    books: Vec<String>,
-    books_state: ListState,
+    view_stack: Vec<View>,
     
-    chapters: Vec<u32>,
-    chapters_state: ListState,
+    input_mode: InputMode,
+    input_buffer: String,
     
-    current_verses: Vec<Verse>,
-    content_scroll: u16,
-    
-    active_pane: ActivePane,
-    
-    search_query: String,
-    search_results: Vec<SearchResult>,
-    search_results_state: ListState,
+    number_buffer: String,
     
     show_version_popup: bool,
     versions_state: ListState,
     
     should_quit: bool,
+    
+    clipboard: Option<Clipboard>,
+    message: Option<String>,
 }
 
 impl App {
@@ -57,122 +80,231 @@ impl App {
         let version = &versions[current_version_idx];
         
         let books = db.get_books(version).unwrap_or_default();
-        let mut books_state = ListState::default();
-        if !books.is_empty() { books_state.select(Some(0)); }
+        let filtered = (0..books.len()).collect();
+        let mut state = ListState::default();
+        if !books.is_empty() {
+            state.select(Some(0));
+        }
         
-        let mut app = Self {
+        let initial_view = View::Books {
+            items: books,
+            filtered,
+            state,
+        };
+        
+        Self {
             db,
             versions,
             current_version_idx,
-            books,
-            books_state,
-            chapters: vec![],
-            chapters_state: ListState::default(),
-            current_verses: vec![],
-            content_scroll: 0,
-            active_pane: ActivePane::Books,
-            search_query: String::new(),
-            search_results: vec![],
-            search_results_state: ListState::default(),
+            view_stack: vec![initial_view],
+            input_mode: InputMode::Normal,
+            input_buffer: String::new(),
+            number_buffer: String::new(),
             show_version_popup: false,
             versions_state: ListState::default(),
             should_quit: false,
-        };
-        
-        app.load_chapters();
-        app.load_content();
-        app
+            clipboard: Clipboard::new().ok(),
+            message: None,
+        }
     }
-
+    
     fn current_version(&self) -> &str {
         &self.versions[self.current_version_idx]
     }
-
-    fn load_chapters(&mut self) {
-        if let Some(idx) = self.books_state.selected() {
-            if let Some(book) = self.books.get(idx) {
-                self.chapters = self.db.get_chapters(self.current_version(), book).unwrap_or_default();
-                if !self.chapters.is_empty() {
-                    self.chapters_state.select(Some(0));
-                } else {
-                    self.chapters_state.select(None);
+    
+    fn push_chapters_view(&mut self, book: String) {
+        let chapters = self.db.get_chapters(self.current_version(), &book).unwrap_or_default();
+        let filtered = (0..chapters.len()).collect();
+        let mut state = ListState::default();
+        if !chapters.is_empty() {
+            state.select(Some(0));
+        }
+        self.view_stack.push(View::Chapters {
+            book,
+            items: chapters,
+            filtered,
+            state,
+        });
+    }
+    
+    fn push_verses_view(&mut self, book: String, chapter: u32) {
+        let verses = self.db.get_chapter(self.current_version(), &book, chapter).unwrap_or_default();
+        let filtered = (0..verses.len()).collect();
+        let mut state = ListState::default();
+        if !verses.is_empty() {
+            state.select(Some(0));
+        }
+        self.view_stack.push(View::Verses {
+            book,
+            chapter,
+            items: verses,
+            filtered,
+            state,
+            visual_start: None,
+        });
+    }
+    
+    fn perform_global_search(&mut self) {
+        if self.input_buffer.is_empty() {
+            self.input_mode = InputMode::Normal;
+            return;
+        }
+        let results = self.db.search(self.current_version(), &self.input_buffer).unwrap_or_default();
+        let mut state = ListState::default();
+        if !results.is_empty() {
+            state.select(Some(0));
+        }
+        self.view_stack.push(View::SearchResults {
+            query: self.input_buffer.clone(),
+            items: results,
+            state,
+        });
+        self.input_buffer.clear();
+        self.input_mode = InputMode::Normal;
+    }
+    
+    fn update_filter(&mut self) {
+        let query = self.input_buffer.to_lowercase();
+        if let Some(view) = self.view_stack.last_mut() {
+            match view {
+                View::Books { items, filtered, state, .. } => {
+                    *filtered = items.iter().enumerate()
+                        .filter(|(_, b)| b.to_lowercase().contains(&query))
+                        .map(|(i, _)| i)
+                        .collect();
+                    state.select(if filtered.is_empty() { None } else { Some(0) });
                 }
+                View::Chapters { items, filtered, state, .. } => {
+                    *filtered = items.iter().enumerate()
+                        .filter(|(_, c)| c.to_string().contains(&query))
+                        .map(|(i, _)| i)
+                        .collect();
+                    state.select(if filtered.is_empty() { None } else { Some(0) });
+                }
+                View::Verses { items, filtered, state, .. } => {
+                    *filtered = items.iter().enumerate()
+                        .filter(|(_, v)| v.text.to_lowercase().contains(&query))
+                        .map(|(i, _)| i)
+                        .collect();
+                    state.select(if filtered.is_empty() { None } else { Some(0) });
+                }
+                _ => {}
             }
         }
     }
-
-    fn load_content(&mut self) {
-        self.content_scroll = 0;
-        if let Some(book_idx) = self.books_state.selected() {
-            if let Some(book) = self.books.get(book_idx) {
-                if let Some(chap_idx) = self.chapters_state.selected() {
-                    if let Some(&chap) = self.chapters.get(chap_idx) {
-                        self.current_verses = self.db.get_chapter(self.current_version(), book, chap).unwrap_or_default();
+    
+    fn process_number_jump(&mut self) {
+        if self.number_buffer.is_empty() { return; }
+        if let Ok(num) = self.number_buffer.parse::<u32>() {
+            let mut jump_info = None;
+            
+            if let Some(view) = self.view_stack.last_mut() {
+                match view {
+                    View::Chapters { items, state, filtered, book } => {
+                        if let Some(idx) = items.iter().position(|c| *c == num) {
+                            if let Some(f_idx) = filtered.iter().position(|&i| i == idx) {
+                                state.select(Some(f_idx));
+                            }
+                            jump_info = Some((book.clone(), num));
+                        } else {
+                            self.message = Some(format!("Chapter {} not found", num));
+                        }
+                    }
+                    View::Verses { items, state, filtered, .. } => {
+                        if let Some(idx) = items.iter().position(|v| v.verse == num) {
+                            if let Some(f_idx) = filtered.iter().position(|&i| i == idx) {
+                                state.select(Some(f_idx));
+                            }
+                        } else {
+                            self.message = Some(format!("Verse {} not found", num));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            
+            if let Some((book, chap)) = jump_info {
+                self.push_verses_view(book, chap);
+            }
+        }
+        self.number_buffer.clear();
+    }
+    
+    fn yank_selection(&mut self) {
+        if let Some(clipboard) = &mut self.clipboard {
+            if let Some(View::Verses { items, filtered, state, visual_start, book, chapter }) = self.view_stack.last_mut() {
+                if let Some(end_idx) = state.selected() {
+                    let start_idx = visual_start.unwrap_or(end_idx);
+                    let min_idx = start_idx.min(end_idx);
+                    let max_idx = start_idx.max(end_idx);
+                    
+                    let mut copied_text = format!("{} {}\n", book, chapter);
+                    for i in min_idx..=max_idx {
+                        if let Some(&orig_idx) = filtered.get(i) {
+                            if let Some(v) = items.get(orig_idx) {
+                                copied_text.push_str(&format!("[{}] {}\n", v.verse, v.text));
+                            }
+                        }
+                    }
+                    
+                    if clipboard.set_text(copied_text).is_ok() {
+                        let count = max_idx - min_idx + 1;
+                        self.message = Some(format!("Yanked {} verse(s)", count));
+                    } else {
+                        self.message = Some("Failed to write to clipboard".to_string());
                     }
                 }
+                *visual_start = None; // Exit visual mode
             }
-        }
-    }
-
-    fn perform_search(&mut self) {
-        if self.search_query.is_empty() { return; }
-        self.search_results = self.db.search(self.current_version(), &self.search_query).unwrap_or_default();
-        if !self.search_results.is_empty() {
-            self.search_results_state.select(Some(0));
-            self.active_pane = ActivePane::SearchResults;
         } else {
-            self.active_pane = ActivePane::Books; // fallback
+            self.message = Some("Clipboard not available".to_string());
         }
     }
     
-    fn jump_to_search_result(&mut self) {
-        if let Some(idx) = self.search_results_state.selected() {
-            if let Some(res) = self.search_results.get(idx).cloned() {
-                // Find book
-                if let Some(b_idx) = self.books.iter().position(|b| b == &res.book) {
-                    self.books_state.select(Some(b_idx));
-                    self.load_chapters();
-                    // Find chapter
-                    if let Some(c_idx) = self.chapters.iter().position(|c| c == &res.chapter) {
-                        self.chapters_state.select(Some(c_idx));
-                        self.load_content();
-                        self.active_pane = ActivePane::Content;
-                        // Approximate scroll (verse - 1)
-                        self.content_scroll = res.verse.saturating_sub(1) as u16 * 2; // rough estimate
-                    }
-                }
-            }
-        }
-    }
-    
-    fn switch_version(&mut self, offset: isize) {
-        if self.versions.is_empty() { return; }
+    fn change_version(&mut self, offset: isize) {
         let len = self.versions.len() as isize;
         let mut idx = self.current_version_idx as isize + offset;
         idx = (idx % len + len) % len;
         self.current_version_idx = idx as usize;
         
-        // Reload all data
-        self.books = self.db.get_books(self.current_version()).unwrap_or_default();
-        if let Some(sel) = self.books_state.selected() {
-            if sel >= self.books.len() {
-                self.books_state.select(Some(self.books.len().saturating_sub(1)));
-            }
-        } else if !self.books.is_empty() {
-            self.books_state.select(Some(0));
-        }
-        self.load_chapters();
-        self.load_content();
+        // Reload current view
+        let old_stack = self.view_stack.clone();
+        self.view_stack.clear();
         
-        if !self.search_query.is_empty() && matches!(self.active_pane, ActivePane::SearchResults) {
-            self.perform_search();
+        // Rebuild stack to refresh data with new version
+        let books = self.db.get_books(self.current_version()).unwrap_or_default();
+        let filtered = (0..books.len()).collect();
+        let mut state = ListState::default();
+        if !books.is_empty() { state.select(Some(0)); }
+        
+        self.view_stack.push(View::Books { items: books, filtered, state });
+        
+        for view in old_stack.iter().skip(1) {
+            match view {
+                View::Chapters { book, .. } => {
+                    self.push_chapters_view(book.clone());
+                }
+                View::Verses { book, chapter, .. } => {
+                    self.push_verses_view(book.clone(), *chapter);
+                }
+                View::SearchResults { query, .. } => {
+                    let results = self.db.search(self.current_version(), query).unwrap_or_default();
+                    let mut state = ListState::default();
+                    if !results.is_empty() { state.select(Some(0)); }
+                    self.view_stack.push(View::SearchResults {
+                        query: query.clone(),
+                        items: results,
+                        state,
+                    });
+                }
+                _ => {}
+            }
         }
     }
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
     let db_path = env::var("VORTO_DB_PATH").unwrap_or_else(|_| "bibles.db".to_string());
-    
     if !std::path::Path::new(&db_path).exists() {
         eprintln!("Database not found at {}. Run the nix build to generate it.", db_path);
         std::process::exit(1);
@@ -190,11 +322,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let res = run_app(&mut terminal, app);
 
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
 
     if let Err(err) = res {
@@ -205,21 +333,27 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<(), Box<dyn Error>> where <B as Backend>::Error: 'static {
+    let mut last_key_was_g = false;
+    let mut last_key_was_bracket_left = false;
+    let mut last_key_was_bracket_right = false;
+    let mut last_key_was_brace_left = false;
+    let mut last_key_was_brace_right = false;
+
     loop {
         terminal.draw(|f| ui(f, &mut app))?;
 
         if let Event::Key(key) = event::read()? {
+            app.message = None; // Clear messages on keypress
+            
             if app.show_version_popup {
                 match key.code {
-                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
-                        app.show_version_popup = false;
-                    }
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => app.show_version_popup = false,
                     KeyCode::Char('j') | KeyCode::Down => {
-                        app.switch_version(1);
+                        app.change_version(1);
                         app.versions_state.select(Some(app.current_version_idx));
                     }
                     KeyCode::Char('k') | KeyCode::Up => {
-                        app.switch_version(-1);
+                        app.change_version(-1);
                         app.versions_state.select(Some(app.current_version_idx));
                     }
                     _ => {}
@@ -227,115 +361,324 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<(), B
                 continue;
             }
 
-            match app.active_pane {
-                ActivePane::SearchInput => match key.code {
-                    KeyCode::Enter => {
-                        app.perform_search();
-                    }
-                    KeyCode::Esc => {
-                        app.active_pane = ActivePane::Books;
-                    }
-                    KeyCode::Backspace => {
-                        app.search_query.pop();
-                    }
-                    KeyCode::Char(c) => {
-                        app.search_query.push(c);
-                    }
+            match app.input_mode {
+                InputMode::Filter => match key.code {
+                    KeyCode::Enter | KeyCode::Esc => app.input_mode = InputMode::Normal,
+                    KeyCode::Backspace => { app.input_buffer.pop(); app.update_filter(); }
+                    KeyCode::Char(c) => { app.input_buffer.push(c); app.update_filter(); }
                     _ => {}
                 },
-                _ => match key.code {
-                    KeyCode::Char('q') => app.should_quit = true,
-                    KeyCode::Char('v') => {
-                        app.show_version_popup = true;
-                        app.versions_state.select(Some(app.current_version_idx));
+                InputMode::GlobalSearch => match key.code {
+                    KeyCode::Enter => app.perform_global_search(),
+                    KeyCode::Esc => { app.input_buffer.clear(); app.input_mode = InputMode::Normal; }
+                    KeyCode::Backspace => { app.input_buffer.pop(); }
+                    KeyCode::Char(c) => { app.input_buffer.push(c); }
+                    _ => {}
+                },
+                InputMode::Normal => {
+                    let mut handled = false;
+                    
+                    // Handle combinations like gg, [[, ]], {{, }}
+                    if let KeyCode::Char('g') = key.code {
+                        if last_key_was_g {
+                            move_cursor(&mut app, MoveDir::Top);
+                            last_key_was_g = false;
+                            handled = true;
+                        } else {
+                            last_key_was_g = true;
+                            handled = true;
+                        }
+                    } else {
+                        last_key_was_g = false;
                     }
-                    KeyCode::Char('/') => {
-                        app.active_pane = ActivePane::SearchInput;
-                    }
-                    KeyCode::Tab => {
-                        app.switch_version(1);
-                    }
-                    KeyCode::Char('h') | KeyCode::Left => {
-                        app.active_pane = match app.active_pane {
-                            ActivePane::Chapters => ActivePane::Books,
-                            ActivePane::Content => ActivePane::Chapters,
-                            ActivePane::SearchResults => ActivePane::Books,
-                            _ => app.active_pane,
-                        };
-                    }
-                    KeyCode::Char('l') | KeyCode::Right => {
-                        app.active_pane = match app.active_pane {
-                            ActivePane::Books => ActivePane::Chapters,
-                            ActivePane::Chapters => ActivePane::Content,
-                            _ => app.active_pane,
-                        };
-                    }
-                    KeyCode::Char('j') | KeyCode::Down => match app.active_pane {
-                        ActivePane::Books => {
-                            if let Some(i) = app.books_state.selected() {
-                                let next = (i + 1).min(app.books.len().saturating_sub(1));
-                                app.books_state.select(Some(next));
-                                app.load_chapters();
-                                app.load_content();
+                    
+                    if let KeyCode::Char('[') = key.code {
+                        if last_key_was_bracket_left {
+                            jump_sibling(&mut app, -1, false);
+                            last_key_was_bracket_left = false;
+                            handled = true;
+                        } else {
+                            last_key_was_bracket_left = true;
+                            handled = true;
+                        }
+                    } else { last_key_was_bracket_left = false; }
+                    
+                    if let KeyCode::Char(']') = key.code {
+                        if last_key_was_bracket_right {
+                            jump_sibling(&mut app, 1, false);
+                            last_key_was_bracket_right = false;
+                            handled = true;
+                        } else {
+                            last_key_was_bracket_right = true;
+                            handled = true;
+                        }
+                    } else { last_key_was_bracket_right = false; }
+
+                    if let KeyCode::Char('{') = key.code {
+                        if last_key_was_brace_left {
+                            jump_sibling(&mut app, -1, true);
+                            last_key_was_brace_left = false;
+                            handled = true;
+                        } else {
+                            last_key_was_brace_left = true;
+                            handled = true;
+                        }
+                    } else { last_key_was_brace_left = false; }
+                    
+                    if let KeyCode::Char('}') = key.code {
+                        if last_key_was_brace_right {
+                            jump_sibling(&mut app, 1, true);
+                            last_key_was_brace_right = false;
+                            handled = true;
+                        } else {
+                            last_key_was_brace_right = true;
+                            handled = true;
+                        }
+                    } else { last_key_was_brace_right = false; }
+                    
+                    if handled { continue; }
+
+                    match key.code {
+                        KeyCode::Char('q') => app.should_quit = true,
+                        KeyCode::Char('-') => {
+                            if app.view_stack.len() > 1 {
+                                app.view_stack.pop();
                             }
                         }
-                        ActivePane::Chapters => {
-                            if let Some(i) = app.chapters_state.selected() {
-                                let next = (i + 1).min(app.chapters.len().saturating_sub(1));
-                                app.chapters_state.select(Some(next));
-                                app.load_content();
+                        KeyCode::Enter => {
+                            if !app.number_buffer.is_empty() {
+                                app.process_number_jump();
+                            } else {
+                                enter_view(&mut app);
                             }
                         }
-                        ActivePane::Content => {
-                            app.content_scroll = app.content_scroll.saturating_add(1);
+                        KeyCode::Char('j') | KeyCode::Down => move_cursor(&mut app, MoveDir::Down),
+                        KeyCode::Char('k') | KeyCode::Up => move_cursor(&mut app, MoveDir::Up),
+                        KeyCode::Char('G') => move_cursor(&mut app, MoveDir::Bottom),
+                        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => move_cursor(&mut app, MoveDir::PageDown),
+                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => move_cursor(&mut app, MoveDir::PageUp),
+                        KeyCode::Char('T') | KeyCode::Char('c') => {
+                            app.show_version_popup = true;
+                            app.versions_state.select(Some(app.current_version_idx));
                         }
-                        ActivePane::SearchResults => {
-                            if let Some(i) = app.search_results_state.selected() {
-                                let next = (i + 1).min(app.search_results.len().saturating_sub(1));
-                                app.search_results_state.select(Some(next));
+                        KeyCode::Char('/') => {
+                            app.input_mode = InputMode::Filter;
+                            app.input_buffer.clear();
+                        }
+                        KeyCode::Char('S') | KeyCode::Char('?') => {
+                            app.input_mode = InputMode::GlobalSearch;
+                            app.input_buffer.clear();
+                        }
+                        KeyCode::Char(c) if c.is_ascii_digit() => {
+                            app.number_buffer.push(c);
+                        }
+                        KeyCode::Char('v') => {
+                            if let Some(View::Verses { state, visual_start, .. }) = app.view_stack.last_mut() {
+                                if visual_start.is_none() {
+                                    *visual_start = state.selected();
+                                    app.message = Some("Visual line selection started".to_string());
+                                } else {
+                                    *visual_start = None;
+                                    app.message = Some("Visual mode cancelled".to_string());
+                                }
+                            }
+                        }
+                        KeyCode::Char('y') => {
+                            app.yank_selection();
+                        }
+                        KeyCode::Esc => {
+                            app.number_buffer.clear();
+                            if let Some(View::Verses { visual_start, .. }) = app.view_stack.last_mut() {
+                                *visual_start = None;
+                            }
+                            // Clear filters
+                            if let Some(view) = app.view_stack.last_mut() {
+                                match view {
+                                    View::Books { filtered, items, state, .. } => {
+                                        *filtered = (0..items.len()).collect();
+                                        state.select(if items.is_empty() { None } else { Some(0) });
+                                    }
+                                    View::Chapters { filtered, items, state, .. } => {
+                                        *filtered = (0..items.len()).collect();
+                                        state.select(if items.is_empty() { None } else { Some(0) });
+                                    }
+                                    View::Verses { filtered, items, state, .. } => {
+                                        *filtered = (0..items.len()).collect();
+                                        state.select(if items.is_empty() { None } else { Some(0) });
+                                    }
+                                    _ => {}
+                                }
                             }
                         }
                         _ => {}
-                    },
-                    KeyCode::Char('k') | KeyCode::Up => match app.active_pane {
-                        ActivePane::Books => {
-                            if let Some(i) = app.books_state.selected() {
-                                let prev = i.saturating_sub(1);
-                                app.books_state.select(Some(prev));
-                                app.load_chapters();
-                                app.load_content();
-                            }
-                        }
-                        ActivePane::Chapters => {
-                            if let Some(i) = app.chapters_state.selected() {
-                                let prev = i.saturating_sub(1);
-                                app.chapters_state.select(Some(prev));
-                                app.load_content();
-                            }
-                        }
-                        ActivePane::Content => {
-                            app.content_scroll = app.content_scroll.saturating_sub(1);
-                        }
-                        ActivePane::SearchResults => {
-                            if let Some(i) = app.search_results_state.selected() {
-                                let prev = i.saturating_sub(1);
-                                app.search_results_state.select(Some(prev));
-                            }
-                        }
-                        _ => {}
-                    },
-                    KeyCode::Enter => {
-                        if matches!(app.active_pane, ActivePane::SearchResults) {
-                            app.jump_to_search_result();
-                        }
                     }
-                    _ => {}
-                },
+                }
             }
         }
         
         if app.should_quit {
             return Ok(());
+        }
+    }
+}
+
+enum MoveDir { Up, Down, Top, Bottom, PageUp, PageDown }
+
+fn move_cursor(app: &mut App, dir: MoveDir) {
+    if let Some(view) = app.view_stack.last_mut() {
+        let (state, len) = match view {
+            View::Books { state, filtered, .. } => (state, filtered.len()),
+            View::Chapters { state, filtered, .. } => (state, filtered.len()),
+            View::Verses { state, filtered, .. } => (state, filtered.len()),
+            View::SearchResults { state, items, .. } => (state, items.len()),
+        };
+        
+        if len == 0 { return; }
+        let current = state.selected().unwrap_or(0);
+        let next = match dir {
+            MoveDir::Up => current.saturating_sub(1),
+            MoveDir::Down => (current + 1).min(len - 1),
+            MoveDir::Top => 0,
+            MoveDir::Bottom => len - 1,
+            MoveDir::PageUp => current.saturating_sub(20), // rough page estimate
+            MoveDir::PageDown => (current + 20).min(len - 1),
+        };
+        state.select(Some(next));
+    }
+}
+
+fn enter_view(app: &mut App) {
+    let mut new_view = None;
+    if let Some(view) = app.view_stack.last() {
+        match view {
+            View::Books { items, filtered, state, .. } => {
+                if let Some(idx) = state.selected() {
+                    if let Some(&orig_idx) = filtered.get(idx) {
+                        if let Some(book) = items.get(orig_idx) {
+                            new_view = Some(View::Chapters {
+                                book: book.clone(),
+                                items: vec![], filtered: vec![], state: ListState::default(),
+                            });
+                        }
+                    }
+                }
+            }
+            View::Chapters { book, items, filtered, state, .. } => {
+                if let Some(idx) = state.selected() {
+                    if let Some(&orig_idx) = filtered.get(idx) {
+                        if let Some(&chapter) = items.get(orig_idx) {
+                            new_view = Some(View::Verses {
+                                book: book.clone(),
+                                chapter,
+                                items: vec![], filtered: vec![], state: ListState::default(), visual_start: None
+                            });
+                        }
+                    }
+                }
+            }
+            View::SearchResults { items, state, .. } => {
+                if let Some(idx) = state.selected() {
+                    if let Some(res) = items.get(idx) {
+                        // Jump directly to verses
+                        new_view = Some(View::Verses {
+                            book: res.book.clone(),
+                            chapter: res.chapter,
+                            items: vec![], filtered: vec![], state: ListState::default(), visual_start: None
+                        });
+                        // Actually we need to set the state to the exact verse after pushing
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    if let Some(mut view) = new_view {
+        match &mut view {
+            View::Chapters { book, .. } => {
+                app.push_chapters_view(book.clone());
+            }
+            View::Verses { book, chapter, .. } => {
+                let book_name = book.clone();
+                let chap = *chapter;
+                
+                // If coming from search result, we want to pre-select the verse
+                let mut target_verse = None;
+                if let Some(View::SearchResults { items, state, .. }) = app.view_stack.last() {
+                    if let Some(idx) = state.selected() {
+                        if let Some(res) = items.get(idx) {
+                            target_verse = Some(res.verse);
+                        }
+                    }
+                }
+                
+                app.push_verses_view(book_name, chap);
+                
+                if let Some(tv) = target_verse {
+                    if let Some(View::Verses { items, filtered, state, .. }) = app.view_stack.last_mut() {
+                        if let Some(v_idx) = items.iter().position(|v| v.verse == tv) {
+                            if let Some(f_idx) = filtered.iter().position(|&i| i == v_idx) {
+                                state.select(Some(f_idx));
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn jump_sibling(app: &mut App, offset: isize, jump_book: bool) {
+    // Determine current book/chapter
+    let mut current = None;
+    
+    for view in app.view_stack.iter().rev() {
+        match view {
+            View::Verses { book, chapter, .. } => {
+                current = Some((book.clone(), *chapter));
+                break;
+            }
+            View::Chapters { book, .. } => {
+                current = Some((book.clone(), 1));
+                break;
+            }
+            _ => {}
+        }
+    }
+    
+    if let Some((book, chapter)) = current {
+        let books = app.db.get_books(app.current_version()).unwrap_or_default();
+        if let Some(b_idx) = books.iter().position(|b| b == &book) {
+            let mut target_b_idx = b_idx;
+            let mut target_chap = chapter;
+            
+            if jump_book {
+                target_b_idx = (b_idx as isize + offset).clamp(0, books.len().saturating_sub(1) as isize) as usize;
+                target_chap = 1;
+            } else {
+                let chapters = app.db.get_chapters(app.current_version(), &book).unwrap_or_default();
+                if let Some(c_idx) = chapters.iter().position(|c| c == &chapter) {
+                    let new_c_idx = c_idx as isize + offset;
+                    if new_c_idx < 0 {
+                        target_b_idx = b_idx.saturating_sub(1);
+                        let prev_chaps = app.db.get_chapters(app.current_version(), &books[target_b_idx]).unwrap_or_default();
+                        target_chap = *prev_chaps.last().unwrap_or(&1);
+                    } else if new_c_idx >= chapters.len() as isize {
+                        target_b_idx = (b_idx + 1).min(books.len().saturating_sub(1));
+                        target_chap = 1;
+                    } else {
+                        target_chap = chapters[new_c_idx as usize];
+                    }
+                }
+            }
+            
+            let target_book = books[target_b_idx].clone();
+            
+            // Rebuild view stack
+            app.view_stack.truncate(1); // Keep Books view
+            app.push_chapters_view(target_book.clone());
+            app.push_verses_view(target_book, target_chap);
         }
     }
 }
@@ -346,109 +689,99 @@ fn ui(f: &mut Frame, app: &mut App) {
     let main_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
-            Constraint::Min(0),
+            Constraint::Length(1), // Top status bar
+            Constraint::Min(0),    // Main content
+            Constraint::Length(1), // Bottom command/status bar
         ])
         .split(size);
         
-    let top_bar = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled(" Vorto ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" | "),
-            Span::styled(format!("Version: {} ", app.current_version()), Style::default().fg(Color::Yellow)),
-            Span::raw("| (h/j/k/l) Navigate | (v) Change Version | (/) Search | (q) Quit")
-        ])
-    ]).block(Block::default().borders(Borders::ALL));
-    f.render_widget(top_bar, main_layout[0]);
+    // Render top bar
+    let path = match app.view_stack.last() {
+        Some(View::Books { .. }) => format!("{} / Books", app.current_version()),
+        Some(View::Chapters { book, .. }) => format!("{} / {}", app.current_version(), book),
+        Some(View::Verses { book, chapter, .. }) => format!("{} / {} / {}", app.current_version(), book, chapter),
+        Some(View::SearchResults { query, .. }) => format!("{} / Search: \"{}\"", app.current_version(), query),
+        None => "".to_string(),
+    };
     
-    let bottom_area = main_layout[1];
-
-    if matches!(app.active_pane, ActivePane::SearchInput) || matches!(app.active_pane, ActivePane::SearchResults) {
-        let search_layout = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Min(0),
-            ])
-            .split(bottom_area);
-            
-        let input_style = if matches!(app.active_pane, ActivePane::SearchInput) {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default()
-        };
-        
-        let search_input = Paragraph::new(app.search_query.as_str())
-            .style(input_style)
-            .block(Block::default().borders(Borders::ALL).title("Search (Enter to submit, Esc to cancel)"));
-        f.render_widget(search_input, search_layout[0]);
-        
-        let items: Vec<ListItem> = app.search_results.iter().map(|res| {
-            let content = Line::from(vec![
-                Span::styled(format!("{} {}:{} - ", res.book, res.chapter, res.verse), Style::default().fg(Color::Cyan)),
-                Span::raw(&res.text),
-            ]);
-            ListItem::new(content)
-        }).collect();
-        
-        let border_style = if matches!(app.active_pane, ActivePane::SearchResults) {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default()
-        };
-        
-        let results_list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title("Results").border_style(border_style))
-            .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD));
-            
-        f.render_stateful_widget(results_list, search_layout[1], &mut app.search_results_state);
-        
-    } else {
-        let panes = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(20),
-                Constraint::Percentage(10),
-                Constraint::Percentage(70),
-            ])
-            .split(bottom_area);
-            
-        let books_items: Vec<ListItem> = app.books.iter().map(|b| ListItem::new(b.as_str())).collect();
-        let border_style = if matches!(app.active_pane, ActivePane::Books) { Style::default().fg(Color::Yellow) } else { Style::default() };
-        let books_list = List::new(books_items)
-            .block(Block::default().borders(Borders::ALL).title("Books").border_style(border_style))
-            .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD));
-        f.render_stateful_widget(books_list, panes[0], &mut app.books_state);
-        
-        let chaps_items: Vec<ListItem> = app.chapters.iter().map(|c| ListItem::new(c.to_string())).collect();
-        let border_style = if matches!(app.active_pane, ActivePane::Chapters) { Style::default().fg(Color::Yellow) } else { Style::default() };
-        let chaps_list = List::new(chaps_items)
-            .block(Block::default().borders(Borders::ALL).title("Chapters").border_style(border_style))
-            .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD));
-        f.render_stateful_widget(chaps_list, panes[1], &mut app.chapters_state);
-        
-        let mut text = vec![];
-        for v in &app.current_verses {
-            text.push(Line::from(vec![
-                Span::styled(format!("{} ", v.verse), Style::default().fg(Color::DarkGray)),
-                Span::raw(&v.text),
-            ]));
-        }
-        
-        let border_style = if matches!(app.active_pane, ActivePane::Content) { Style::default().fg(Color::Yellow) } else { Style::default() };
-        
-        let title = if let (Some(b_idx), Some(c_idx)) = (app.books_state.selected(), app.chapters_state.selected()) {
-            if let (Some(book), Some(chap)) = (app.books.get(b_idx), app.chapters.get(c_idx)) {
-                format!(" {} {} ", book, chap)
-            } else { " Content ".to_string() }
-        } else { " Content ".to_string() };
-        
-        let content_p = Paragraph::new(text)
-            .block(Block::default().borders(Borders::ALL).title(title).border_style(border_style))
-            .wrap(Wrap { trim: true })
-            .scroll((app.content_scroll, 0));
-        f.render_widget(content_p, panes[2]);
+    let mut top_text = vec![Span::styled(format!(" {} ", path), Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD))];
+    if !app.number_buffer.is_empty() {
+        top_text.push(Span::raw(format!(" | Jump: {}", app.number_buffer)));
     }
+    
+    f.render_widget(Paragraph::new(Line::from(top_text)), main_layout[0]);
+    
+    // Render main content
+    if let Some(view) = app.view_stack.last_mut() {
+        match view {
+            View::Books { items, filtered, state } => {
+                let list_items: Vec<ListItem> = filtered.iter().map(|&i| {
+                    ListItem::new(format!(" {}", items[i]))
+                }).collect();
+                let list = List::new(list_items)
+                    .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+                f.render_stateful_widget(list, main_layout[1], state);
+            }
+            View::Chapters { items, filtered, state, .. } => {
+                let list_items: Vec<ListItem> = filtered.iter().map(|&i| {
+                    ListItem::new(format!(" Chapter {}", items[i]))
+                }).collect();
+                let list = List::new(list_items)
+                    .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+                f.render_stateful_widget(list, main_layout[1], state);
+            }
+            View::Verses { items, filtered, state, visual_start, .. } => {
+                let list_items: Vec<ListItem> = filtered.iter().enumerate().map(|(ui_idx, &i)| {
+                    let v = &items[i];
+                    let mut style = Style::default();
+                    
+                    if let Some(start) = *visual_start {
+                        if let Some(curr) = state.selected() {
+                            let min = start.min(curr);
+                            let max = start.max(curr);
+                            if ui_idx >= min && ui_idx <= max {
+                                style = style.bg(Color::DarkGray);
+                            }
+                        }
+                    }
+                    
+                    ListItem::new(Line::from(vec![
+                        Span::styled(format!("{:>3} ", v.verse), Style::default().fg(Color::DarkGray)),
+                        Span::raw(&v.text),
+                    ])).style(style)
+                }).collect();
+                let list = List::new(list_items)
+                    .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+                f.render_stateful_widget(list, main_layout[1], state);
+            }
+            View::SearchResults { items, state, .. } => {
+                let list_items: Vec<ListItem> = items.iter().map(|res| {
+                    ListItem::new(Line::from(vec![
+                        Span::styled(format!("{:<15} {:>3}:{:>3} | ", res.book, res.chapter, res.verse), Style::default().fg(Color::Cyan)),
+                        Span::raw(&res.text),
+                    ]))
+                }).collect();
+                let list = List::new(list_items)
+                    .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+                f.render_stateful_widget(list, main_layout[1], state);
+            }
+        }
+    }
+    
+    // Render bottom bar
+    let bottom_text = match app.input_mode {
+        InputMode::Filter => format!("Filter: {}█", app.input_buffer),
+        InputMode::GlobalSearch => format!("Global Search: {}█", app.input_buffer),
+        InputMode::Normal => {
+            if let Some(msg) = &app.message {
+                msg.clone()
+            } else {
+                "q:quit | -:back | Enter:open | T:version | /:filter | S:global_search | v:select | y:copy".to_string()
+            }
+        }
+    };
+    
+    f.render_widget(Paragraph::new(bottom_text).style(Style::default().fg(Color::Gray)), main_layout[2]);
     
     if app.show_version_popup {
         let area = centered_rect(40, 40, size);
