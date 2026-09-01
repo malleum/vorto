@@ -50,6 +50,7 @@ enum InputMode {
     Normal,
     Filter,
     GlobalSearch,
+    JumpMenu,
 }
 
 struct App {
@@ -57,12 +58,17 @@ struct App {
     versions: Vec<String>,
     current_version_idx: usize,
     
+    all_books: Vec<String>,
+    
     view_stack: Vec<View>,
+    jump_list: Vec<Vec<View>>,
+    jump_idx: usize,
     
     input_mode: InputMode,
     input_buffer: String,
     
     number_buffer: String,
+    jump_menu_buffer: String,
     
     show_version_popup: bool,
     versions_state: ListState,
@@ -80,6 +86,8 @@ impl App {
         let version = &versions[current_version_idx];
         
         let books = db.get_books(version).unwrap_or_default();
+        let all_books = books.clone();
+        
         let filtered = (0..books.len()).collect();
         let mut state = ListState::default();
         if !books.is_empty() {
@@ -96,10 +104,14 @@ impl App {
             db,
             versions,
             current_version_idx,
+            all_books,
             view_stack: vec![initial_view],
+            jump_list: Vec::new(),
+            jump_idx: 0,
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             number_buffer: String::new(),
+            jump_menu_buffer: String::new(),
             show_version_popup: false,
             versions_state: ListState::default(),
             should_quit: false,
@@ -108,6 +120,49 @@ impl App {
         }
     }
     
+    fn record_jump(&mut self) {
+        self.jump_list.truncate(self.jump_idx);
+        self.jump_list.push(self.view_stack.clone());
+        self.jump_idx += 1;
+    }
+    
+    fn jump_backward(&mut self) {
+        if self.jump_idx > 0 {
+            if self.jump_idx == self.jump_list.len() {
+                self.jump_list.push(self.view_stack.clone());
+            }
+            self.jump_idx -= 1;
+            self.view_stack = self.jump_list[self.jump_idx].clone();
+        }
+    }
+
+    fn jump_forward(&mut self) {
+        if self.jump_idx + 1 < self.jump_list.len() {
+            self.jump_idx += 1;
+            self.view_stack = self.jump_list[self.jump_idx].clone();
+        }
+    }
+    
+    fn clear_current_filter(&mut self) {
+        if let Some(view) = self.view_stack.last_mut() {
+            match view {
+                View::Books { filtered, items, state, .. } => {
+                    *filtered = (0..items.len()).collect();
+                    state.select(if items.is_empty() { None } else { Some(0) });
+                }
+                View::Chapters { filtered, items, state, .. } => {
+                    *filtered = (0..items.len()).collect();
+                    state.select(if items.is_empty() { None } else { Some(0) });
+                }
+                View::Verses { filtered, items, state, .. } => {
+                    *filtered = (0..items.len()).collect();
+                    state.select(if items.is_empty() { None } else { Some(0) });
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn current_version(&self) -> &str {
         &self.versions[self.current_version_idx]
     }
@@ -154,6 +209,7 @@ impl App {
         if !results.is_empty() {
             state.select(Some(0));
         }
+        self.record_jump();
         self.view_stack.push(View::SearchResults {
             query: self.input_buffer.clone(),
             items: results,
@@ -224,6 +280,7 @@ impl App {
             }
             
             if let Some((book, chap)) = jump_info {
+                self.record_jump();
                 self.push_verses_view(book, chap);
             }
         }
@@ -267,11 +324,9 @@ impl App {
         idx = (idx % len + len) % len;
         self.current_version_idx = idx as usize;
         
-        // Reload current view
         let old_stack = self.view_stack.clone();
         self.view_stack.clear();
         
-        // Rebuild stack to refresh data with new version
         let books = self.db.get_books(self.current_version()).unwrap_or_default();
         let filtered = (0..books.len()).collect();
         let mut state = ListState::default();
@@ -301,6 +356,64 @@ impl App {
             }
         }
     }
+}
+
+fn parse_jump_menu(app: &App) -> Option<(String, Option<u32>, Option<u32>)> {
+    let parts: Vec<&str> = app.jump_menu_buffer.split_whitespace().collect();
+    if parts.is_empty() { return None; }
+    
+    let mut book_query = parts[0].to_string();
+    let mut rest_idx = 1;
+    if parts[0].chars().all(char::is_numeric) && parts.len() > 1 && !parts[1].chars().all(char::is_numeric) {
+        book_query = format!("{} {}", parts[0], parts[1]);
+        rest_idx = 2;
+    }
+    
+    let query_lower = book_query.to_lowercase();
+    let mut best_book = None;
+    
+    for b in &app.all_books {
+        if b.to_lowercase() == query_lower {
+            best_book = Some(b.clone());
+            break;
+        }
+    }
+    
+    if best_book.is_none() {
+        for b in &app.all_books {
+            if b.to_lowercase().starts_with(&query_lower) {
+                best_book = Some(b.clone());
+                break;
+            }
+        }
+    }
+    
+    if best_book.is_none() {
+        for b in &app.all_books {
+            if b.to_lowercase().contains(&query_lower) {
+                best_book = Some(b.clone());
+                break;
+            }
+        }
+    }
+    
+    let book = best_book?;
+    
+    let mut chap = None;
+    let mut verse = None;
+    
+    if rest_idx < parts.len() {
+        if let Ok(c) = parts[rest_idx].parse::<u32>() {
+            chap = Some(c);
+        }
+        if rest_idx + 1 < parts.len() {
+            if let Ok(v) = parts[rest_idx + 1].parse::<u32>() {
+                verse = Some(v);
+            }
+        }
+    }
+    
+    Some((book, chap, verse))
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -343,7 +456,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<(), B
         terminal.draw(|f| ui(f, &mut app))?;
 
         if let Event::Key(key) = event::read()? {
-            app.message = None; // Clear messages on keypress
+            app.message = None;
             
             if app.show_version_popup {
                 match key.code {
@@ -363,9 +476,23 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<(), B
 
             match app.input_mode {
                 InputMode::Filter => match key.code {
-                    KeyCode::Enter | KeyCode::Esc => app.input_mode = InputMode::Normal,
+                    KeyCode::Enter => {
+                        app.input_mode = InputMode::Normal;
+                        app.input_buffer.clear();
+                        app.clear_current_filter();
+                        enter_view(&mut app);
+                    }
+                    KeyCode::Esc => {
+                        app.input_mode = InputMode::Normal;
+                        app.input_buffer.clear();
+                        app.clear_current_filter();
+                    }
                     KeyCode::Backspace => { app.input_buffer.pop(); app.update_filter(); }
-                    KeyCode::Char(c) => { app.input_buffer.push(c); app.update_filter(); }
+                    KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => move_cursor(&mut app, MoveDir::Up),
+                    KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => move_cursor(&mut app, MoveDir::Down),
+                    KeyCode::Tab => move_cursor(&mut app, MoveDir::Down),
+                    KeyCode::BackTab => move_cursor(&mut app, MoveDir::Up),
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => { app.input_buffer.push(c); app.update_filter(); }
                     _ => {}
                 },
                 InputMode::GlobalSearch => match key.code {
@@ -375,10 +502,44 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<(), B
                     KeyCode::Char(c) => { app.input_buffer.push(c); }
                     _ => {}
                 },
+                InputMode::JumpMenu => match key.code {
+                    KeyCode::Esc => {
+                        app.input_mode = InputMode::Normal;
+                        app.jump_menu_buffer.clear();
+                    }
+                    KeyCode::Enter => {
+                        if let Some((book, chap, verse)) = parse_jump_menu(&app) {
+                            app.record_jump();
+                            app.view_stack.truncate(1); // root books
+                            app.push_chapters_view(book.clone());
+                            let c = chap.unwrap_or(1);
+                            app.push_verses_view(book.clone(), c);
+                            if let Some(v) = verse {
+                                if let Some(View::Verses { items, state, .. }) = app.view_stack.last_mut() {
+                                    if let Some(idx) = items.iter().position(|x| x.verse == v) {
+                                        state.select(Some(idx));
+                                    }
+                                }
+                            }
+                            app.input_mode = InputMode::Normal;
+                            app.jump_menu_buffer.clear();
+                        }
+                    }
+                    KeyCode::Tab => {
+                        if let Some((best_match, _, _)) = parse_jump_menu(&app) {
+                            let parts: Vec<&str> = app.jump_menu_buffer.split_whitespace().collect();
+                            if parts.len() <= 2 {
+                                app.jump_menu_buffer = best_match + " ";
+                            }
+                        }
+                    }
+                    KeyCode::Backspace => { app.jump_menu_buffer.pop(); }
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => { app.jump_menu_buffer.push(c); }
+                    _ => {}
+                },
                 InputMode::Normal => {
                     let mut handled = false;
                     
-                    // Handle combinations like gg, [[, ]], {{, }}
                     if let KeyCode::Char('g') = key.code {
                         if last_key_was_g {
                             move_cursor(&mut app, MoveDir::Top);
@@ -388,9 +549,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<(), B
                             last_key_was_g = true;
                             handled = true;
                         }
-                    } else {
-                        last_key_was_g = false;
-                    }
+                    } else { last_key_was_g = false; }
                     
                     if let KeyCode::Char('[') = key.code {
                         if last_key_was_bracket_left {
@@ -442,22 +601,32 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<(), B
                         KeyCode::Char('q') => app.should_quit = true,
                         KeyCode::Char('-') => {
                             if app.view_stack.len() > 1 {
+                                app.record_jump();
                                 app.view_stack.pop();
+                                app.clear_current_filter();
                             }
                         }
                         KeyCode::Enter => {
                             if !app.number_buffer.is_empty() {
                                 app.process_number_jump();
                             } else {
+                                app.record_jump();
+                                app.clear_current_filter();
                                 enter_view(&mut app);
                             }
+                        }
+                        KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.jump_backward();
+                        }
+                        KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.jump_forward();
                         }
                         KeyCode::Char('j') | KeyCode::Down => move_cursor(&mut app, MoveDir::Down),
                         KeyCode::Char('k') | KeyCode::Up => move_cursor(&mut app, MoveDir::Up),
                         KeyCode::Char('G') => move_cursor(&mut app, MoveDir::Bottom),
                         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => move_cursor(&mut app, MoveDir::PageDown),
                         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => move_cursor(&mut app, MoveDir::PageUp),
-                        KeyCode::Char('T') | KeyCode::Char('c') => {
+                        KeyCode::Char('t') | KeyCode::Char('c') => {
                             app.show_version_popup = true;
                             app.versions_state.select(Some(app.current_version_idx));
                         }
@@ -468,6 +637,10 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<(), B
                         KeyCode::Char('S') | KeyCode::Char('?') => {
                             app.input_mode = InputMode::GlobalSearch;
                             app.input_buffer.clear();
+                        }
+                        KeyCode::Char(' ') => {
+                            app.input_mode = InputMode::JumpMenu;
+                            app.jump_menu_buffer.clear();
                         }
                         KeyCode::Char(c) if c.is_ascii_digit() => {
                             app.number_buffer.push(c);
@@ -491,24 +664,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<(), B
                             if let Some(View::Verses { visual_start, .. }) = app.view_stack.last_mut() {
                                 *visual_start = None;
                             }
-                            // Clear filters
-                            if let Some(view) = app.view_stack.last_mut() {
-                                match view {
-                                    View::Books { filtered, items, state, .. } => {
-                                        *filtered = (0..items.len()).collect();
-                                        state.select(if items.is_empty() { None } else { Some(0) });
-                                    }
-                                    View::Chapters { filtered, items, state, .. } => {
-                                        *filtered = (0..items.len()).collect();
-                                        state.select(if items.is_empty() { None } else { Some(0) });
-                                    }
-                                    View::Verses { filtered, items, state, .. } => {
-                                        *filtered = (0..items.len()).collect();
-                                        state.select(if items.is_empty() { None } else { Some(0) });
-                                    }
-                                    _ => {}
-                                }
-                            }
+                            app.clear_current_filter();
                         }
                         _ => {}
                     }
@@ -540,7 +696,7 @@ fn move_cursor(app: &mut App, dir: MoveDir) {
             MoveDir::Down => (current + 1).min(len - 1),
             MoveDir::Top => 0,
             MoveDir::Bottom => len - 1,
-            MoveDir::PageUp => current.saturating_sub(20), // rough page estimate
+            MoveDir::PageUp => current.saturating_sub(20),
             MoveDir::PageDown => (current + 20).min(len - 1),
         };
         state.select(Some(next));
@@ -579,13 +735,11 @@ fn enter_view(app: &mut App) {
             View::SearchResults { items, state, .. } => {
                 if let Some(idx) = state.selected() {
                     if let Some(res) = items.get(idx) {
-                        // Jump directly to verses
                         new_view = Some(View::Verses {
                             book: res.book.clone(),
                             chapter: res.chapter,
                             items: vec![], filtered: vec![], state: ListState::default(), visual_start: None
                         });
-                        // Actually we need to set the state to the exact verse after pushing
                     }
                 }
             }
@@ -602,7 +756,6 @@ fn enter_view(app: &mut App) {
                 let book_name = book.clone();
                 let chap = *chapter;
                 
-                // If coming from search result, we want to pre-select the verse
                 let mut target_verse = None;
                 if let Some(View::SearchResults { items, state, .. }) = app.view_stack.last() {
                     if let Some(idx) = state.selected() {
@@ -630,9 +783,7 @@ fn enter_view(app: &mut App) {
 }
 
 fn jump_sibling(app: &mut App, offset: isize, jump_book: bool) {
-    // Determine current book/chapter
     let mut current = None;
-    
     for view in app.view_stack.iter().rev() {
         match view {
             View::Verses { book, chapter, .. } => {
@@ -675,8 +826,8 @@ fn jump_sibling(app: &mut App, offset: isize, jump_book: bool) {
             
             let target_book = books[target_b_idx].clone();
             
-            // Rebuild view stack
-            app.view_stack.truncate(1); // Keep Books view
+            app.record_jump();
+            app.view_stack.truncate(1);
             app.push_chapters_view(target_book.clone());
             app.push_verses_view(target_book, target_chap);
         }
@@ -689,13 +840,12 @@ fn ui(f: &mut Frame, app: &mut App) {
     let main_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // Top status bar
-            Constraint::Min(0),    // Main content
-            Constraint::Length(1), // Bottom command/status bar
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
         ])
         .split(size);
         
-    // Render top bar
     let path = match app.view_stack.last() {
         Some(View::Books { .. }) => format!("{} / Books", app.current_version()),
         Some(View::Chapters { book, .. }) => format!("{} / {}", app.current_version(), book),
@@ -711,7 +861,6 @@ fn ui(f: &mut Frame, app: &mut App) {
     
     f.render_widget(Paragraph::new(Line::from(top_text)), main_layout[0]);
     
-    // Render main content
     if let Some(view) = app.view_stack.last_mut() {
         match view {
             View::Books { items, filtered, state } => {
@@ -768,15 +917,15 @@ fn ui(f: &mut Frame, app: &mut App) {
         }
     }
     
-    // Render bottom bar
     let bottom_text = match app.input_mode {
         InputMode::Filter => format!("Filter: {}█", app.input_buffer),
         InputMode::GlobalSearch => format!("Global Search: {}█", app.input_buffer),
+        InputMode::JumpMenu => "Jump Menu Active".to_string(),
         InputMode::Normal => {
             if let Some(msg) = &app.message {
                 msg.clone()
             } else {
-                "q:quit | -:back | Enter:open | T:version | /:filter | S:global_search | v:select | y:copy".to_string()
+                "q:quit | -:back | Enter:open | t:version | /:filter | Space:jump | S:search | v:select | y:copy | C-o/i:jump-hist".to_string()
             }
         }
     };
@@ -793,6 +942,44 @@ fn ui(f: &mut Frame, app: &mut App) {
             .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD));
             
         f.render_stateful_widget(list, area, &mut app.versions_state);
+    }
+    
+    if app.input_mode == InputMode::JumpMenu {
+        let area = centered_rect(50, 20, size);
+        f.render_widget(Clear, area);
+        
+        let mut text = vec![
+            Line::from(Span::styled("Type: <Book> [Chapter] [Verse]", Style::default().fg(Color::Gray))),
+            Line::from(""),
+            Line::from(format!("> {}█", app.jump_menu_buffer)),
+            Line::from(""),
+        ];
+        
+        if let Some((book, chap, verse)) = parse_jump_menu(&app) {
+            let mut preview_line = vec![Span::styled(book.clone(), Style::default().fg(Color::Green))];
+            
+            let chapters = app.db.get_chapters(app.current_version(), &book).unwrap_or_default();
+            let mut c_valid = true;
+            if let Some(c) = chap {
+                if !chapters.contains(&c) { c_valid = false; }
+                preview_line.push(Span::raw(" "));
+                preview_line.push(Span::styled(c.to_string(), Style::default().fg(if c_valid { Color::Green } else { Color::Red })));
+            }
+            
+            if let Some(v) = verse {
+                let verses = app.db.get_chapter(app.current_version(), &book, chap.unwrap_or(1)).unwrap_or_default();
+                let v_valid = c_valid && verses.iter().any(|x| x.verse == v);
+                preview_line.push(Span::raw(":"));
+                preview_line.push(Span::styled(v.to_string(), Style::default().fg(if v_valid { Color::Green } else { Color::Red })));
+            }
+            
+            text.push(Line::from(preview_line));
+        } else {
+            text.push(Line::from(Span::styled("No match...", Style::default().fg(Color::DarkGray))));
+        }
+        
+        let block = Block::default().borders(Borders::ALL).title(" Quick Jump ").border_style(Style::default().fg(Color::Cyan));
+        f.render_widget(Paragraph::new(text).block(block), area);
     }
 }
 
