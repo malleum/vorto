@@ -104,5 +104,18 @@ def build_db(db_path, zips):
 
 if __name__ == '__main__':
     db_path = sys.argv[1]
-    zips = {'BSB': sys.argv[2], 'WEB': sys.argv[3], 'LSV': sys.argv[4], 'Esperanto': sys.argv[5], 'Vulgate': sys.argv[6]}
+    zips = {}
+    for path in sys.argv[2:]:
+        filename = os.path.basename(path)
+        name = filename.replace('_usfm.zip', '')
+        pretty_names = {
+            'engbsb': 'BSB',
+            'engwebp': 'WEB',
+            'englsv': 'LSV',
+            'epo': 'Esperanto',
+            'latVUC': 'Vulgate',
+            'eng-kjv2006': 'KJV',
+            'noblb': 'NOBLB'
+        }
+        zips[pretty_names.get(name, name)] = path
     build_db(db_path, zips)
