@@ -17,7 +17,7 @@
           src = ./.;
           nativeBuildInputs = [ pkgs.python3 pkgs.sqlite ];
           buildPhase = ''
-            python3 build_db.py bibles.db data/engbsb_usfm.zip data/engwebp_usfm.zip data/englsv_usfm.zip data/epo_usfm.zip data/latVUC_usfm.zip
+            python3 build_db.py bibles.db data/engbsb_usfm.zip data/engwebp_usfm.zip data/englsv_usfm.zip data/epo_usfm.zip data/latVUC_usfm.zip data/eng-kjv2006_usfm.zip data/noblb_usfm.zip
           '';
           installPhase = ''
             mkdir -p $out/share/vorto

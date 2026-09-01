@@ -15,7 +15,40 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
+use serde::{Deserialize, Serialize};
 use std::{env, error::Error, io};
+
+#[derive(Serialize, Deserialize, Default, Clone)]
+struct Config {
+    version_order: Vec<String>,
+    hidden_versions: Vec<String>,
+}
+
+impl Config {
+    fn load() -> Self {
+        if let Some(mut path) = dirs::config_dir() {
+            path.push("vorto");
+            path.push("config.json");
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if let Ok(cfg) = serde_json::from_str(&content) {
+                    return cfg;
+                }
+            }
+        }
+        Config::default()
+    }
+    
+    fn save(&self) {
+        if let Some(mut path) = dirs::config_dir() {
+            path.push("vorto");
+            let _ = std::fs::create_dir_all(&path);
+            path.push("config.json");
+            if let Ok(content) = serde_json::to_string_pretty(self) {
+                let _ = std::fs::write(path, content);
+            }
+        }
+    }
+}
 
 #[derive(Clone)]
 enum View {
@@ -51,10 +84,14 @@ enum InputMode {
     Filter,
     GlobalSearch,
     JumpMenu,
+    SortMenu,
 }
 
 struct App {
     db: Database,
+    config: Config,
+    
+    all_versions: Vec<String>,
     versions: Vec<String>,
     current_version_idx: usize,
     
@@ -72,6 +109,7 @@ struct App {
     
     show_version_popup: bool,
     versions_state: ListState,
+    sort_state: ListState,
     
     should_quit: bool,
     
@@ -81,8 +119,27 @@ struct App {
 
 impl App {
     fn new(db: Database) -> Self {
-        let versions = db.get_versions().unwrap_or_else(|_| vec!["BSB".to_string()]);
-        let current_version_idx = versions.iter().position(|v| v == "BSB").unwrap_or(0);
+        let all_db_versions = db.get_versions().unwrap_or_else(|_| vec!["BSB".to_string()]);
+        let config = Config::load();
+        
+        let mut all_versions = config.version_order.clone();
+        for v in &all_db_versions {
+            if !all_versions.contains(v) {
+                all_versions.push(v.clone());
+            }
+        }
+        all_versions.retain(|v| all_db_versions.contains(v));
+        
+        let mut versions: Vec<String> = all_versions.iter()
+            .filter(|v| !config.hidden_versions.contains(v))
+            .cloned()
+            .collect();
+            
+        if versions.is_empty() {
+            versions = all_versions.clone();
+        }
+        
+        let current_version_idx = 0;
         let version = &versions[current_version_idx];
         
         let books = db.get_books(version).unwrap_or_default();
@@ -102,6 +159,8 @@ impl App {
         
         Self {
             db,
+            config,
+            all_versions,
             versions,
             current_version_idx,
             all_books,
@@ -114,6 +173,7 @@ impl App {
             jump_menu_buffer: String::new(),
             show_version_popup: false,
             versions_state: ListState::default(),
+            sort_state: ListState::default(),
             should_quit: false,
             clipboard: Clipboard::new().ok(),
             message: None,
@@ -330,7 +390,6 @@ impl App {
                 }
             }
             if !success {
-                // Fallback to wl-copy for wayland
                 if let Ok(mut child) = std::process::Command::new("wl-copy").stdin(std::process::Stdio::piped()).spawn() {
                     if let Some(mut stdin) = child.stdin.take() {
                         let _ = std::io::Write::write_all(&mut stdin, copied_text.as_bytes());
@@ -341,7 +400,6 @@ impl App {
                 }
             }
             if !success {
-                // Fallback to xclip for X11
                 if let Ok(mut child) = std::process::Command::new("xclip").arg("-selection").arg("clipboard").stdin(std::process::Stdio::piped()).spawn() {
                     if let Some(mut stdin) = child.stdin.take() {
                         let _ = std::io::Write::write_all(&mut stdin, copied_text.as_bytes());
@@ -361,6 +419,8 @@ impl App {
     }
     
     fn change_version(&mut self, offset: isize) {
+        if self.versions.is_empty() { return; }
+        
         let len = self.versions.len() as isize;
         let mut idx = self.current_version_idx as isize + offset;
         idx = (idx % len + len) % len;
@@ -527,6 +587,61 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<(), B
             }
 
             match app.input_mode {
+                InputMode::SortMenu => match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
+                        app.input_mode = InputMode::Normal;
+                        app.config.save();
+                        let old_v = app.current_version().to_string();
+                        app.versions = app.all_versions.iter()
+                            .filter(|v| !app.config.hidden_versions.contains(v))
+                            .cloned()
+                            .collect();
+                        if app.versions.is_empty() {
+                            app.versions = app.all_versions.clone();
+                        }
+                        if !app.versions.contains(&old_v) {
+                            app.current_version_idx = 0;
+                            app.change_version(0);
+                        } else {
+                            app.current_version_idx = app.versions.iter().position(|v| v == &old_v).unwrap_or(0);
+                        }
+                    }
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        let i = app.sort_state.selected().unwrap_or(0);
+                        app.sort_state.select(Some((i + 1).min(app.all_versions.len().saturating_sub(1))));
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        let i = app.sort_state.selected().unwrap_or(0);
+                        app.sort_state.select(Some(i.saturating_sub(1)));
+                    }
+                    KeyCode::Char('J') => {
+                        let i = app.sort_state.selected().unwrap_or(0);
+                        if i + 1 < app.all_versions.len() {
+                            app.all_versions.swap(i, i + 1);
+                            app.config.version_order = app.all_versions.clone();
+                            app.sort_state.select(Some(i + 1));
+                        }
+                    }
+                    KeyCode::Char('K') => {
+                        let i = app.sort_state.selected().unwrap_or(0);
+                        if i > 0 {
+                            app.all_versions.swap(i, i - 1);
+                            app.config.version_order = app.all_versions.clone();
+                            app.sort_state.select(Some(i - 1));
+                        }
+                    }
+                    KeyCode::Char(' ') => {
+                        if let Some(i) = app.sort_state.selected() {
+                            let v = &app.all_versions[i];
+                            if app.config.hidden_versions.contains(v) {
+                                app.config.hidden_versions.retain(|x| x != v);
+                            } else {
+                                app.config.hidden_versions.push(v.clone());
+                            }
+                        }
+                    }
+                    _ => {}
+                },
                 InputMode::Filter => match key.code {
                     KeyCode::Enter => {
                         app.input_mode = InputMode::Normal;
@@ -684,6 +799,10 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<(), B
                         KeyCode::Char('t') | KeyCode::Char('c') => {
                             app.show_version_popup = true;
                             app.versions_state.select(Some(app.current_version_idx));
+                        }
+                        KeyCode::Char('T') => {
+                            app.input_mode = InputMode::SortMenu;
+                            app.sort_state.select(Some(0));
                         }
                         KeyCode::Char('/') => {
                             app.input_mode = InputMode::Filter;
@@ -1012,11 +1131,12 @@ fn ui(f: &mut Frame, app: &mut App) {
         InputMode::Filter => format!("Filter: {}█", app.input_buffer),
         InputMode::GlobalSearch => format!("Global Search: {}█", app.input_buffer),
         InputMode::JumpMenu => "Jump Menu Active".to_string(),
+        InputMode::SortMenu => "Sort Menu: J/K move, Space hide".to_string(),
         InputMode::Normal => {
             if let Some(msg) = &app.message {
                 msg.clone()
             } else {
-                "q:quit | -:back | Enter:open | t:version | /:filter | Space:jump | S:search | v:select | y:copy | C-o/i:jump-hist".to_string()
+                "q:quit | Enter:open | t:version | T:sort_versions | /:filter | Space:jump | S:search | v:select | y:copy".to_string()
             }
         }
     };
@@ -1034,6 +1154,24 @@ fn ui(f: &mut Frame, app: &mut App) {
             .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD));
             
         f.render_stateful_widget(list, area, &mut app.versions_state);
+    }
+    
+    if app.input_mode == InputMode::SortMenu {
+        let popup_height = (app.all_versions.len() as u16 + 2).min(size.height);
+        let area = top_right_rect(40, popup_height, size);
+        f.render_widget(Clear, area);
+        
+        let items: Vec<ListItem> = app.all_versions.iter().map(|v| {
+            let hidden = app.config.hidden_versions.contains(v);
+            let prefix = if hidden { "[ ]" } else { "[x]" };
+            ListItem::new(format!("{} {}", prefix, v))
+                .style(if hidden { Style::default().fg(Color::DarkGray) } else { Style::default() })
+        }).collect();
+        let list = List::new(items)
+            .block(Block::default().borders(Borders::ALL).title(" Sort/Hide (J/K move, Space hide) ").border_style(Style::default().fg(Color::Yellow)))
+            .highlight_style(Style::default().bg(Color::Rgb(60, 60, 60)).add_modifier(Modifier::BOLD));
+            
+        f.render_stateful_widget(list, area, &mut app.sort_state);
     }
     
     if app.input_mode == InputMode::JumpMenu {
