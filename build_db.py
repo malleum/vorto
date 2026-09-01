@@ -23,15 +23,11 @@ book_map = {
 }
 
 def strip_usfm_tags(text):
-    text = re.sub(r'\\w\s+([^|]+?)\|[^\]]*?\\w\*', r'\1', text)
-    text = re.sub(r'\\f.*?\\f\*', '', text)
-    text = re.sub(r'\\x.*?\\x\*', '', text)
-    text = re.sub(r'\\[a-z]+\s+(.*?)\\[a-z]+\*', r'\1', text)
-    text = re.sub(r'\\[a-z0-9]+\s?', '', text)
-    text = re.sub(r'\[\\w\s+is\|[^\]]*?\\w\*\]', 'is', text)
-    text = re.sub(r'\[\\w\s+([^|]+?)\|[^\]]*?\\w\*\]', r'\1', text)
-    text = re.sub(r'\[\\w\s+([^\]]+)\]', r'\1', text)
-    text = re.sub(r'\[\s*\]', '', text)
+    text = re.sub(r'\\[fx]\s.*?\\[fx]\*', '', text)
+    text = re.sub(r'(\\[+a-z0-9]+)\s+([^|]*?)\|.*?\1\*', r'\2', text)
+    text = re.sub(r'(\\[+a-z0-9]+)\s+(.*?)\1\*', r'\2', text)
+    text = re.sub(r'\\[+a-z0-9]+\s*', '', text)
+    text = re.sub(r'\[\s*([^\]]+?)\s*\]', r'\1', text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
