@@ -34,6 +34,7 @@
           cargoLock = {
             lockFile = ./Cargo.lock;
           };
+          buildInputs = [ pkgs.sqlite ];
           nativeBuildInputs = [ pkgs.makeWrapper ];
           postInstall = ''
             wrapProgram $out/bin/vorto \
