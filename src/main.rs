@@ -292,26 +292,39 @@ impl App {
     }
     
     fn update_filter(&mut self) {
-        let query = self.input_buffer.to_lowercase();
+        let query = self.input_buffer.clone();
+        let re = regex::RegexBuilder::new(&query).case_insensitive(true).build();
+        let q_lower = query.to_lowercase();
+        
         if let Some(view) = self.view_stack.last_mut() {
             match view {
                 View::Books { items, filtered, state, .. } => {
                     *filtered = items.iter().enumerate()
-                        .filter(|(_, b)| b.to_lowercase().contains(&query))
+                        .filter(|(_, b)| {
+                            if let Ok(ref regex) = re { regex.is_match(b) }
+                            else { b.to_lowercase().contains(&q_lower) }
+                        })
                         .map(|(i, _)| i)
                         .collect();
                     state.select(if filtered.is_empty() { None } else { Some(0) });
                 }
                 View::Chapters { items, filtered, state, .. } => {
                     *filtered = items.iter().enumerate()
-                        .filter(|(_, c)| c.to_string().contains(&query))
+                        .filter(|(_, c)| {
+                            let s = c.to_string();
+                            if let Ok(ref regex) = re { regex.is_match(&s) }
+                            else { s.contains(&q_lower) }
+                        })
                         .map(|(i, _)| i)
                         .collect();
                     state.select(if filtered.is_empty() { None } else { Some(0) });
                 }
                 View::Verses { items, filtered, state, .. } => {
                     *filtered = items.iter().enumerate()
-                        .filter(|(_, v)| v.text.to_lowercase().contains(&query))
+                        .filter(|(_, v)| {
+                            if let Ok(ref regex) = re { regex.is_match(&v.text) }
+                            else { v.text.to_lowercase().contains(&q_lower) }
+                        })
                         .map(|(i, _)| i)
                         .collect();
                     state.select(if filtered.is_empty() { None } else { Some(0) });

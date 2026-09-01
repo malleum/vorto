@@ -2058,6 +2058,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "ratatui",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

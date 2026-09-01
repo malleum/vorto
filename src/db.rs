@@ -90,45 +90,41 @@ impl Database {
     }
 
     pub fn search(&self, version: &str, query: &str) -> Result<Vec<SearchResult>> {
-        // Use FTS5 for search
-        let sql = "SELECT book, chapter, verse, text FROM verses_fts WHERE bible = ? AND text MATCH ? ORDER BY rank LIMIT 100";
-        let mut stmt = self.conn.prepare(sql)?;
+        let mut stmt = self.conn.prepare("SELECT book, chapter, verse, text FROM verses WHERE bible = ?1")?;
         
-        // FTS match syntax requires quotes if query has spaces, or we just append * to terms
-        // For simplicity, we just pass the raw query. If it errors, we fallback to LIKE.
-        let fts_query = format!("\"{}\"", query.replace("\"", "\"\""));
+        let mut results = Vec::new();
         
-        match stmt.query_map([version, &fts_query], |row| {
+        // Try to compile the query as a regex
+        let re = regex::RegexBuilder::new(query).case_insensitive(true).build();
+        
+        let rows = stmt.query_map([version], |row| {
             Ok(SearchResult {
                 book: row.get(0)?,
                 chapter: row.get(1)?,
                 verse: row.get(2)?,
                 text: row.get(3)?,
             })
-        }) {
-            Ok(iter) => {
-                let results = iter.filter_map(Result::ok).collect::<Vec<_>>();
-                if !results.is_empty() {
-                    return Ok(results);
-                }
-            },
-            Err(_) => {}
-        }
+        })?;
 
-        // Fallback to LIKE if FTS fails or returns 0
-        let sql_like = "SELECT book, chapter, verse, text FROM verses WHERE bible = ? AND text LIKE ? LIMIT 100";
-        let mut stmt_like = self.conn.prepare(sql_like)?;
-        let like_query = format!("%{}%", query);
-        let results = stmt_like.query_map([version, &like_query], |row| {
-            Ok(SearchResult {
-                book: row.get(0)?,
-                chapter: row.get(1)?,
-                verse: row.get(2)?,
-                text: row.get(3)?,
-            })
-        })?
-        .filter_map(Result::ok)
-        .collect();
+        if let Ok(regex) = re {
+            for row in rows {
+                if let Ok(res) = row {
+                    if regex.is_match(&res.text) {
+                        results.push(res);
+                    }
+                }
+            }
+        } else {
+            // Fallback to basic lowercase text search if regex is invalid (e.g. while typing '[')
+            let q_lower = query.to_lowercase();
+            for row in rows {
+                if let Ok(res) = row {
+                    if res.text.to_lowercase().contains(&q_lower) {
+                        results.push(res);
+                    }
+                }
+            }
+        }
         
         Ok(results)
     }
